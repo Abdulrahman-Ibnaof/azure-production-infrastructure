@@ -1,0 +1,192 @@
+name: "Terraform — Azure Infrastructure"
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**.tf"
+      - "**.tfvars"
+      - ".github/workflows/terraform.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "**.tf"
+      - "**.tfvars"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        default: "dev"
+        type: choice
+        options: [dev, staging, prod]
+      action:
+        description: "Terraform action"
+        required: true
+        default: "plan"
+        type: choice
+        options: [plan, apply, destroy]
+
+env:
+  TF_VERSION: "1.7.4"
+  ARM_CLIENT_ID:       ${{ secrets.AZURE_CLIENT_ID }}
+  ARM_CLIENT_SECRET:   ${{ secrets.AZURE_CLIENT_SECRET }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  ARM_TENANT_ID:       ${{ secrets.AZURE_TENANT_ID }}
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
+
+jobs:
+  # ── Security Scan ──────────────────────────────────────────────────────────
+  security-scan:
+    name: "Security Scan (tfsec + checkov)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run tfsec
+        uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          soft_fail: true
+
+      - name: Run Checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+          framework: terraform
+          soft_fail: true
+          output_format: sarif
+          output_file_path: results.sarif
+
+      - name: Upload SARIF results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: results.sarif
+
+  # ── Terraform Validate ─────────────────────────────────────────────────────
+  validate:
+    name: "Validate & Format"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Init (validate only)
+        run: terraform init -backend=false
+
+      - name: Terraform Validate
+        run: terraform validate
+
+  # ── Plan ───────────────────────────────────────────────────────────────────
+  plan:
+    name: "Plan — ${{ github.event.inputs.environment || 'dev' }}"
+    runs-on: ubuntu-latest
+    needs: [security-scan, validate]
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    env:
+      TF_ENV: ${{ github.event.inputs.environment || 'dev' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -reconfigure \
+            -backend-config="key=${{ env.TF_ENV }}/infrastructure.tfstate"
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          terraform plan \
+            -var-file="environments/${{ env.TF_ENV }}/terraform.tfvars" \
+            -var="subscription_id=$ARM_SUBSCRIPTION_ID" \
+            -var="tenant_id=$ARM_TENANT_ID" \
+            -out=tfplan \
+            -detailed-exitcode
+        continue-on-error: true
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ env.TF_ENV }}
+          path: tfplan
+          retention-days: 5
+
+      - name: Post Plan to PR
+        uses: actions/github-script@v7
+        if: github.event_name == 'pull_request'
+        with:
+          script: |
+            const output = `#### Terraform Plan — \`${{ env.TF_ENV }}\`
+            **Result:** \`${{ steps.plan.outcome }}\`
+            
+            <details><summary>Show Plan</summary>
+            
+            \`\`\`hcl
+            ${{ steps.plan.outputs.stdout }}
+            \`\`\`
+            
+            </details>`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+
+  # ── Apply (main branch or manual trigger only) ─────────────────────────────
+  apply:
+    name: "Apply — ${{ github.event.inputs.environment || 'dev' }}"
+    runs-on: ubuntu-latest
+    needs: [plan]
+    if: |
+      (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply')
+    environment:
+      name: ${{ github.event.inputs.environment || 'dev' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Download plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ github.event.inputs.environment || 'dev' }}
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="key=${{ github.event.inputs.environment || 'dev' }}/infrastructure.tfstate"
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve tfplan
+
+      - name: Export outputs
+        run: terraform output -json > tf-outputs.json
+
+      - name: Upload outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: tf-outputs-${{ github.event.inputs.environment || 'dev' }}
+          path: tf-outputs.json
+          retention-days: 30
